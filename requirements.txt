@@ -1,0 +1,4 @@
+beautifulsoup4==4.13.4
+cloudscraper==1.2.60
+Requests==2.32.4
+tqdm==4.64.1
