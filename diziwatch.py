@@ -149,8 +149,14 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
                             burst_limit = random.randint(20, 30)
                 
                 except requests.exceptions.RequestException as e:
-                    pbar.set_postfix_str("Bağlantı hatası, 5sn sonra tekrar deneniyor...")
-                    time.sleep(5)
+                    if 'RemoteDisconnected' in str(e):
+                        print("   - UYARI: RemoteDisconnected tespit edildi, segment tekrar deneniyor...")
+                        wait_time = 8
+                    else:
+                        print(f"   - UYARI: Segment bağlantı hatası: {e}")
+                        wait_time = 5   
+                    pbar.set_postfix_str(f"Bağlantı hatası, {wait_time}s sonra tekrar deneniyor...")
+                    time.sleep(wait_time)
                     continue
 
     try:
