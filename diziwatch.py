@@ -128,7 +128,7 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
             pbar = tqdm(total=len(segment_urls), desc=f"   [-> {description}]", unit=" parça", leave=True)
             
             segments_in_burst = 0
-            burst_limit = random.randint(30, 45) 
+            burst_limit = random.randint(20, 30) 
 
             for i, url in enumerate(segment_urls):
                 try:
@@ -146,7 +146,7 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
                             time.sleep(pause_duration)
                             pbar.set_postfix_str("") 
                             segments_in_burst = 0
-                            burst_limit = random.randint(30, 45)
+                            burst_limit = random.randint(20, 30)
                 
                 except requests.exceptions.RequestException as e:
                     pbar.set_postfix_str("Bağlantı hatası, 5sn sonra tekrar deneniyor...")
