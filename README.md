@@ -31,14 +31,14 @@ This is a two-part system, and both are required:
 
 You need a few things set up first:
 
-1.  **Python 3:** Install the required Python libraries:
+1.  **Python 3:** Install all the required Python libraries using the requirements.txt file:
     ```bash
-    pip install requests beautifulsoup4 cloudscraper tqdm
+    pip install -r requirements.txt
     ```
 
-2.  **Node.js:** After installing Node.js, run this command in the script's directory to get the necessary Node packages:
+2.  **Node.js:** After installing Node.js, run this command in the script's directory. It will automatically install all the necessary packages listed in package.json.
     ```bash
-    npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth cheerio
+    npm install
     ```
 
 3.  **FFmpeg:** This is **mandatory**, not a suggestion. It merges the video, audio, and subtitle files. Get it from the [official website](https://ffmpeg.org/download.html) and add it to your system's `PATH`.
