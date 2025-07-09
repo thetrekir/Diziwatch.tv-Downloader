@@ -5,7 +5,6 @@ import subprocess
 from urllib.parse import urlparse, urljoin
 import random
 import time
-import threading
 import requests
 import cloudscraper
 from bs4 import BeautifulSoup
@@ -102,18 +101,42 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
     temp_subtitle_path = final_output_path + ".vtt"
     temp_files = [temp_video_path, temp_audio_path, temp_subtitle_path]
     
-    def download_segments(playlist_url, output_path, referer, description, position=0):
+    def download_segments(playlist_url, output_path, referer, description):
         scraper = cloudscraper.create_scraper()
         playlist_response = scraper.get(playlist_url, headers={'Referer': referer})
         playlist_response.raise_for_status()
         segment_urls = re.findall(r'^(https://.+)', playlist_response.text, re.MULTILINE)
         if not segment_urls: raise ValueError(f"{description} için segment URL'leri bulunamadı.")
+        
         with open(output_path, 'wb') as f_out:
-            pbar = tqdm(segment_urls, desc=f"   [-> {description}]", unit=" parça", leave=False, position=position)
-            for url in pbar:
-                segment_response = scraper.get(url, headers={'Referer': referer})
-                segment_response.raise_for_status()
-                f_out.write(segment_response.content)
+            pbar = tqdm(total=len(segment_urls), desc=f"   [-> {description}]", unit=" parça", leave=True)
+            
+            segments_in_burst = 0
+            burst_limit = random.randint(25, 40) 
+
+            for i, url in enumerate(segment_urls):
+                try:
+                    segment_response = scraper.get(url, headers={'Referer': referer}, timeout=20)
+                    segment_response.raise_for_status()
+                    f_out.write(segment_response.content)
+                    
+                    pbar.update(1)
+                    segments_in_burst += 1
+
+                    if segments_in_burst >= burst_limit and (i + 1) < len(segment_urls):
+                        pause_duration = random.uniform(4, 8)
+                        pbar.set_postfix_str(f"Rate-Limit önleme için ({int(pause_duration)}s mola)...")
+                        time.sleep(pause_duration)
+                        pbar.set_postfix_str("") 
+
+                        segments_in_burst = 0
+                        burst_limit = random.randint(25, 40)
+                
+                except requests.exceptions.RequestException as e:
+                    pbar.set_postfix_str("Bağlantı hatası, 5sn sonra tekrar deneniyor...")
+                    time.sleep(5)
+                    continue
+
 
     try:
         scraper = cloudscraper.create_scraper()
@@ -139,16 +162,15 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
         audio_uri_match = re.search(r'#EXT-X-MEDIA:TYPE=AUDIO.*?URI="(.*?)"', master_playlist_content)
         
         if audio_uri_match:
-            print("-> Ayrı akışlar tespit edildi. Paralel indirme başlıyor...")
+            print("-> Ayrı akışlar tespit edildi. Sıralı indirme başlıyor (Anti-Rate Limit)...")
             audio_playlist_url = urljoin(m_php_url, audio_uri_match.group(1))
             video_playlist_match = re.findall(r'#EXT-X-STREAM-INF:.*\n(https.*)', master_playlist_content)
             video_playlist_url = video_playlist_match[-1]
 
-            video_thread = threading.Thread(target=download_segments, args=(video_playlist_url, temp_video_path, m_php_url, "Video", 0))
-            audio_thread = threading.Thread(target=download_segments, args=(audio_playlist_url, temp_audio_path, m_php_url, "Ses", 1))
-            video_thread.start(); audio_thread.start()
-            video_thread.join(); audio_thread.join()
-            print("\n-> Paralel indirmeler tamamlandı.")
+            download_segments(video_playlist_url, temp_video_path, m_php_url, "Video")
+            download_segments(audio_playlist_url, temp_audio_path, m_php_url, "Ses")
+            
+            print("-> Sıralı indirmeler tamamlandı.")
 
             print("-> FFmpeg ile birleştirme işlemi hazırlanıyor...")
             command = ['ffmpeg', '-y', '-i', temp_video_path, '-i', temp_audio_path]
@@ -168,19 +190,17 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
             if not playlist_url_match: raise ValueError("Birleşik akış için playlist URL'si bulunamadı.")
             
             combined_playlist_url = playlist_url_match.group(1)
-            download_segments(combined_playlist_url, temp_video_path, m_php_url, "Video/Ses", 0)
+            download_segments(combined_playlist_url, temp_video_path, m_php_url, "Video/Ses")
 
             print("-> FFmpeg ile dönüştürme işlemi hazırlanıyor (remux)...")
             command = ['ffmpeg', '-y', '-i', temp_video_path]
             if altyazi_var:
                 command.extend(['-i', temp_subtitle_path])
             
+            command.extend(['-c', 'copy'])
             if altyazi_var:
-                command.extend(['-map', '0', '-map', '1'])
+                command.extend(['-map', '0', '-map', '-0:s', '-map', '1'])
                 command.extend(['-c:s', 'mov_text', '-metadata:s:s:0', 'language=tur'])
-                command.extend(['-c:v', 'copy', '-c:a', 'copy'])
-            else:
-                command.extend(['-c', 'copy'])
 
             command.extend(['-bsf:a', 'aac_adtstoasc', final_output_path])
 
@@ -272,10 +292,10 @@ def main():
             
             indir_diziwatch(link, output_path)
             successful_downloads.append(display_name)
-            if i < len(episode_links):
-                wait_time = random.uniform(5, 10)
-                print(f"-> Anti-bot tespiti için {int(wait_time)} saniye bekleniyor...")
-                time.sleep(wait_time)
+            #if i < len(episode_links):
+            #    wait_time = random.uniform(5, 10)
+            #    print(f"-> Anti-bot tespiti için {int(wait_time)} saniye bekleniyor...")
+            #    time.sleep(wait_time)
         except Exception as e:
             error_info = f"'{display_name}' - Sebep: {e}"
             print(f"HATA: {error_info}"); failed_downloads.append(error_info)
