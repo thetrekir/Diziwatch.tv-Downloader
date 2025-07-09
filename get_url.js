@@ -2,22 +2,29 @@
 
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+const fs = require('fs').promises;
+const cheerio = require('cheerio');
+
 puppeteer.use(StealthPlugin());
 
-async function getSourceAndSubtitleUrls(episodeUrl) {
-    const browser = await puppeteer.launch({ 
-        headless: 'new',
-        args: [
-            '--no-sandbox', 
-            '--disable-setuid-sandbox', 
-            '--window-size=1920,1080', 
-            '--disable-infobars', 
-            '--disable-blink-features=AutomationControlled'
-        ],
-        ignoreDefaultArgs: ['--enable-automation']
-    });
-    
-    const page = await browser.newPage();
+const CACHE_FILE = 'fillerlist_cache.json';
+const CACHE_DURATION_DAYS = 7;
+
+function normalizeShowName(name) {
+    if (!name) return '';
+    return name
+        .toLowerCase()
+        .replace(/\b(part|season|saison|sezon)\s*\d+/g, '')
+        .replace(/one-piece-1/g, 'one piece')
+        .replace(/[^\w\s]/g, ' ')
+        .replace(/(.)\1+/g, '$1')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+async function getDiziwatchData(page, episodeUrl) {
+    let foundSource2Url = null;
+    let foundSubtitleUrl = null;
 
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1920, height: 1080 });
@@ -28,100 +35,158 @@ async function getSourceAndSubtitleUrls(episodeUrl) {
         urls: ['*fastly.jsdelivr.net*', '*cdn.jsdelivr.net*'] 
     });
 
-    let foundSource2Url = null;
-    let foundSubtitleUrl = null;
+    let subtitlePriority = 0;
+    let resolveDetection;
+    const detectionPromise = new Promise(resolve => { resolveDetection = resolve; });
 
-    try {
-        const detectionPromise = new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                if (foundSource2Url && !foundSubtitleUrl) {
-                    resolve();
-                } else {
-                    reject(new Error("Zaman asimi: URL'ler 20 saniye icinde bulunamadi."));
-                }
-            }, 20000);
-
-            page.on('request', (request) => {
-                const url = request.url();
-                let needsCheck = false;
-
-                if (url.includes('source2.php') && !foundSource2Url) {
-                    foundSource2Url = url;
-                    needsCheck = true;
-                }
-                
-                if (url.includes('translateden.vtt') && !foundSubtitleUrl) {
-                    foundSubtitleUrl = url;
-                    needsCheck = true;
-                }
-
-                if (needsCheck && foundSource2Url && foundSubtitleUrl) {
-                    clearTimeout(timeout);
-                    resolve();
-                }
-            });
-        });
-
-        page.goto(episodeUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {
-        });
-
-        await detectionPromise;
-
-        let output = {};
-        if (foundSource2Url) output.source_url = foundSource2Url;
-        if (foundSubtitleUrl) output.subtitle_url = foundSubtitleUrl;
-        
-        return output;
-        
-    } catch (error) {
-        if (foundSource2Url) {
-            console.warn("Uyarı: Ana kaynak bulundu fakat altyazı bulunamadı.");
-            return { source_url: foundSource2Url };
+    const requestListener = (request) => {
+        const url = request.url();
+        if (url.includes('source2.php') && !foundSource2Url) {
+            foundSource2Url = url;
         }
-
-        const errorPath = `error_screenshot_${Date.now()}.png`;
-        console.error(`Hata oluştu. Ekran görüntüsü kaydediliyor: ${errorPath}`);
-        try {
-            await page.screenshot({ path: errorPath, fullPage: true });
-        } catch (ssError) {
-            console.error(`Ekran görüntüsü alınamadı: ${ssError.message}`);
+        if (url.includes('.vtt')) {
+           let p = 0;
+           if (url.includes('translateden.vtt')) p = 4;
+           else if (url.includes('.tr.')) p = 3;
+           else if (!url.includes('en.vtt')) p = 2;
+           else if (url.includes('en.vtt')) p = 1;
+           if (p > subtitlePriority) {
+               foundSubtitleUrl = url;
+               subtitlePriority = p;
+           }
         }
-        
-        throw error;
+        if (foundSource2Url && subtitlePriority === 4) {
+            resolveDetection();
+        }
+    };
+    
+    page.on('request', requestListener);
+    detectionPromise.finally(() => page.off('request', requestListener));
 
-    } finally {
-        if (browser) {
-            await browser.close();
+    const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error("Zaman asimi: URL'ler 20 saniye icinde bulunamadi.")), 20000)
+    );
+
+    await page.goto(episodeUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+
+    if (!foundSource2Url) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        if (!foundSource2Url) {
+            try {
+                await page.mouse.click(page.viewport().width / 2, page.viewport().height / 2);
+            } catch (e) {}
         }
     }
+    
+    try {
+        await Promise.race([detectionPromise, timeoutPromise]);
+    } catch (e) {
+        if (!foundSource2Url) {
+            throw e;
+        }
+    }
+
+    return { source_url: foundSource2Url, subtitle_url: foundSubtitleUrl };
+}
+
+async function getFillerList(page, showNameToSearch) {
+    let allShows = {}, cacheIsValid = false;
+    try {
+        const stats = await fs.stat(CACHE_FILE);
+        const ageInDays = (new Date().getTime() - stats.mtime.getTime()) / (1000 * 3600 * 24);
+        if (ageInDays < CACHE_DURATION_DAYS) cacheIsValid = true;
+    } catch (e) { cacheIsValid = false; }
+
+    if (cacheIsValid) {
+        allShows = JSON.parse(await fs.readFile(CACHE_FILE, 'utf-8'));
+    } else {
+        await page.goto("https://www.animefillerlist.com/shows/", { waitUntil: 'networkidle2' });
+        const content = await page.content();
+        const $ = cheerio.load(content);
+        $('#ShowList a').each((i, el) => { allShows[$(el).text().trim()] = $(el).attr('href'); });
+        await fs.writeFile(CACHE_FILE, JSON.stringify(allShows, null, 2));
+    }
+
+    const normalizedSearch = normalizeShowName(showNameToSearch);
+    let foundLink = null;
+    for (const [name, link] of Object.entries(allShows)) {
+        if (normalizeShowName(name) === normalizedSearch) {
+            foundLink = link;
+            break;
+        }
+    }
+
+    if (!foundLink) return [];
+    
+    await page.goto("https://www.animefillerlist.com" + foundLink, { waitUntil: 'networkidle2' });
+    
+    try {
+        await page.waitForSelector('#Condensed', { timeout: 15000 });
+    } catch(e) {
+        return [];
+    }
+
+    const content = await page.content();
+    const $ = cheerio.load(content);
+    const fillerEpisodes = new Set();
+    // --- HARDCODED ---
+    const episodeLinks = $('div.filler span.Episodes a');
+    
+    episodeLinks.each((j, el) => {
+        const text = $(el).text().trim();
+        if (text.includes('-')) {
+            const [start, end] = text.split('-').map(num => parseInt(num, 10));
+            if (!isNaN(start) && !isNaN(end)) for (let k = start; k <= end; k++) fillerEpisodes.add(k);
+        } else if (text && !isNaN(text)) {
+            fillerEpisodes.add(parseInt(text, 10));
+        }
+    });
+
+    return Array.from(fillerEpisodes).sort((a, b) => a - b);
 }
 
 async function main() {
     const args = process.argv.slice(2);
     if (args.length < 1) {
-        console.error('Kullanim: node get_media_urls.js "<dizi_bolum_url>"');
         process.exit(1);
     }
     const episodeUrl = args[0];
+    const getFillersFlagIndex = args.indexOf('--get-fillers');
+    const getFillers = getFillersFlagIndex !== -1;
+    const showNameToSearch = getFillers ? args[getFillersFlagIndex + 1] : null;
+
+    if (getFillers && !showNameToSearch) {
+        process.exit(1);
+    }
+
+    const browser = await puppeteer.launch({ 
+        headless: 'new',
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--window-size=1920,1080', '--disable-infobars', '--disable-blink-features=AutomationControlled', '--mute-audio'],
+        ignoreDefaultArgs: ['--enable-automation']
+    });
+    const page = await browser.newPage();
+    let finalOutput = {};
 
     try {
-        console.log(`URL'ler alınıyor: ${episodeUrl}`);
-        const urls = await getSourceAndSubtitleUrls(episodeUrl);
+        const diziwatchData = await getDiziwatchData(page, episodeUrl);
+        finalOutput.source_url = diziwatchData.source_url;
+        finalOutput.subtitle_url = diziwatchData.subtitle_url;
 
-        if (urls && urls.source_url) {
-            console.log("\n--- SONUÇ ---");
-            console.log(`SOURCE_URL: ${urls.source_url}`);
-            if (urls.subtitle_url) {
-                console.log(`SUBTITLE_URL: ${urls.subtitle_url}`);
-            }
-            process.exit(0);
-        } else {
-            throw new Error("Kaynak URL'si bulunamadi.");
+        if (getFillers && showNameToSearch) {
+            const fillerList = await getFillerList(page, showNameToSearch);
+            finalOutput.filler_list = fillerList;
         }
+
+        if (finalOutput.source_url) console.log(`SOURCE_URL: ${finalOutput.source_url}`);
+        if (finalOutput.subtitle_url) console.log(`SUBTITLE_URL: ${finalOutput.subtitle_url}`);
+        if (finalOutput.filler_list) console.log(`FILLER_LIST: ${JSON.stringify(finalOutput.filler_list)}`);
+
     } catch (e) {
-        console.error(`\nHATA: İşlem başarısız oldu.`);
-        console.error(`Detay: ${e.message}`);
+        const errorPath = `error_screenshot_${Date.now()}.png`;
+        try { await page.screenshot({ path: errorPath, fullPage: true }); } catch (ssError) {}
         process.exit(1);
+    } finally {
+        if (browser) await browser.close();
     }
 }
 
