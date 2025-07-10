@@ -179,30 +179,60 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
             except Exception as e:
                 print(f"UYARI: Altyazı indirilemedi. Sebep: {e}. İşleme altyazısız devam edilecek.")
                 altyazi_var = False
-
-        audio_uri_match = re.search(r'#EXT-X-MEDIA:TYPE=AUDIO.*?URI="(.*?)"', master_playlist_content)
         
-        if audio_uri_match:
-            print("-> Ayrı akışlar tespit edildi. Paralel indirme başlıyor...")
-            audio_playlist_url = urljoin(m_php_url, audio_uri_match.group(1))
-            video_playlist_match = re.findall(r'#EXT-X-STREAM-INF:.*\n(https.*)', master_playlist_content)
-            video_playlist_url = video_playlist_match[-1]
-            video_task = threading.Thread(target=download_segments, args=(video_playlist_url, temp_video_path, m_php_url, "Video"))
-            audio_task = threading.Thread(target=download_segments, args=(audio_playlist_url, temp_audio_path, m_php_url, "Ses"))
-            video_task.start()
-            audio_task.start()
-            video_task.join()
-            audio_task.join()
-            print("-> İndirmeler tamamlandı.")
-            print("-> FFmpeg ile birleştirme işlemi hazırlanıyor...")
-            command = ['ffmpeg', '-y', '-i', temp_video_path, '-i', temp_audio_path]
-            if altyazi_var: command.extend(['-i', temp_subtitle_path])
-            command.extend(['-map', '0:v:0', '-map', '1:a:0'])
-            if altyazi_var:
-                command.extend(['-map', '2:s:0', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=tur'])
-            command.extend(['-c:v', 'copy', '-c:a', 'copy', final_output_path])
+        available_streams = []
+        stream_matches = re.finditer(r'#EXT-X-STREAM-INF:(?P<attributes>.*?)\n(?P<url>https?://[^\s]+)', master_playlist_content)
+        
+        for match in stream_matches:
+            attrs = match.group('attributes')
+            url = match.group('url')
+            
+            res_match = re.search(r'RESOLUTION=\d+x(\d+)', attrs)
+            resolution = int(res_match.group(1)) if res_match else 0
+            
+            bw_match = re.search(r'BANDWIDTH=(\d+)', attrs)
+            bandwidth = int(bw_match.group(1)) if bw_match else 0
+            
+            available_streams.append({'url': url, 'resolution': resolution, 'bandwidth': bandwidth})
+
+        if available_streams:
+            available_streams.sort(key=lambda x: (x['resolution'], x['bandwidth']), reverse=True)
+            best_stream_url = available_streams[0]['url']
+            best_resolution = available_streams[0]['resolution']
+            print(f"-> {best_resolution}p kalitesi indirilmek üzere seçildi.")
+
+            audio_uri_match = re.search(r'#EXT-X-MEDIA:TYPE=AUDIO.*?URI="(.*?)"', master_playlist_content)
+            if audio_uri_match:
+                print("-> Ayrı akışlar tespit edildi. Paralel indirme başlıyor...")
+                audio_playlist_url = urljoin(m_php_url, audio_uri_match.group(1))
+                video_playlist_url = best_stream_url
+                video_task = threading.Thread(target=download_segments, args=(video_playlist_url, temp_video_path, m_php_url, "Video"))
+                audio_task = threading.Thread(target=download_segments, args=(audio_playlist_url, temp_audio_path, m_php_url, "Ses"))
+                video_task.start()
+                audio_task.start()
+                video_task.join()
+                audio_task.join()
+                print("-> İndirmeler tamamlandı.")
+                print("-> FFmpeg ile birleştirme işlemi hazırlanıyor...")
+                command = ['ffmpeg', '-y', '-i', temp_video_path, '-i', temp_audio_path]
+                if altyazi_var: command.extend(['-i', temp_subtitle_path])
+                command.extend(['-map', '0:v:0', '-map', '1:a:0'])
+                if altyazi_var:
+                    command.extend(['-map', '2:s:0', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=tur'])
+                command.extend(['-c:v', 'copy', '-c:a', 'copy', final_output_path])
+            else:
+                print("-> Birleşik video/ses akışı tespit edildi.")
+                combined_playlist_url = best_stream_url
+                download_segments(combined_playlist_url, temp_video_path, m_php_url, "Video/Ses")
+                print("-> FFmpeg ile dönüştürme işlemi hazırlanıyor (remux)...")
+                command = ['ffmpeg', '-y', '-i', temp_video_path]
+                if altyazi_var: command.extend(['-i', temp_subtitle_path])
+                command.extend(['-c', 'copy'])
+                if altyazi_var:
+                    command.extend(['-map', '0', '-map', '-0:s', '-map', '1', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=tur'])
+                command.extend(['-bsf:a', 'aac_adtstoasc', final_output_path])
         else:
-            print("-> Birleşik video/ses akışı tespit edildi.")
+            print("-> Tek bir video/ses akışı tespit edildi.")
             playlist_url_match = re.search(r'^(https://.+)', master_playlist_content, re.MULTILINE)
             if not playlist_url_match: raise ValueError("Birleşik akış için playlist URL'si bulunamadı.")
             combined_playlist_url = playlist_url_match.group(1)
@@ -214,7 +244,7 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
             if altyazi_var:
                 command.extend(['-map', '0', '-map', '-0:s', '-map', '1', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=tur'])
             command.extend(['-bsf:a', 'aac_adtstoasc', final_output_path])
-
+        
         subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print("-> Dönüştürme tamamlandı.")
 
