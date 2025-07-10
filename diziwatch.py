@@ -117,47 +117,70 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
     temp_subtitle_path = final_output_path + ".vtt"
     temp_files = [temp_video_path, temp_audio_path, temp_subtitle_path]
     
-    def download_segments(playlist_url, output_path, referer, description):
+    print_lock = threading.Lock()
+
+    def download_segments(playlist_url, output_path, referer, description, apply_rate_limit: bool, lock: threading.Lock, pbar: tqdm):
         scraper = cloudscraper.create_scraper()
-        playlist_response = scraper.get(playlist_url, headers={'Referer': referer})
-        playlist_response.raise_for_status()
-        segment_urls = re.findall(r'^(https://.+)', playlist_response.text, re.MULTILINE)
+        
+        try:
+            playlist_response = scraper.get(playlist_url, headers={'Referer': referer}, timeout=20)
+            playlist_response.raise_for_status()
+            playlist_text = playlist_response.text
+        except requests.exceptions.RequestException as e:
+            raise RuntimeError(f"{description} için playlist alınamadı: {e}")
+
+        segment_urls = re.findall(r'^(https?://.+)', playlist_text, re.MULTILINE)
         if not segment_urls: raise ValueError(f"{description} için segment URL'leri bulunamadı.")
         
         with open(output_path, 'wb') as f_out:
-            pbar = tqdm(total=len(segment_urls), desc=f"   [-> {description}]", unit=" parça", leave=True)
-            
             segments_in_burst = 0
-            burst_limit = random.randint(20, 30) 
-
+            burst_limit = random.randint(40, 60)
+            
             for i, url in enumerate(segment_urls):
-                try:
-                    segment_response = scraper.get(url, headers={'Referer': referer}, timeout=20)
-                    segment_response.raise_for_status()
-                    f_out.write(segment_response.content)
-                    
-                    pbar.update(1)
-                    
-                    if not ignore_rate_limit:
-                        segments_in_burst += 1
-                        if segments_in_burst >= burst_limit and (i + 1) < len(segment_urls):
-                            pause_duration = random.uniform(2, 4)
-                            pbar.set_postfix_str(f"Rate-Limit önleme için ({int(pause_duration)}s mola)...")
-                            time.sleep(pause_duration)
-                            pbar.set_postfix_str("") 
-                            segments_in_burst = 0
-                            burst_limit = random.randint(20, 30)
-                
-                except requests.exceptions.RequestException as e:
-                    if 'RemoteDisconnected' in str(e):
-                        print("   - UYARI: RemoteDisconnected tespit edildi, segment tekrar deneniyor...")
-                        wait_time = 8
-                    else:
-                        print(f"   - UYARI: Segment bağlantı hatası: {e}")
-                        wait_time = 5   
-                    pbar.set_postfix_str(f"Bağlantı hatası, {wait_time}s sonra tekrar deneniyor...")
-                    time.sleep(wait_time)
-                    continue
+                retries = 0
+                max_retries_per_segment = 5
+                while retries < max_retries_per_segment:
+                    try:
+                        segment_response = scraper.get(url, headers={'Referer': referer}, timeout=25)
+                        segment_response.raise_for_status()
+                        f_out.write(segment_response.content)
+                        with lock: pbar.update(1)
+                        break 
+                    except requests.exceptions.RequestException as e:
+                        retries += 1
+                        error_str = str(e)
+                        
+                        if 'RemoteDisconnected' in error_str: error_msg, wait_time = "Sunucu bağlantıyı kapattı", 8
+                        else: error_msg, wait_time = "Bağlantı hatası", 5 * retries
+                        
+                        if retries >= max_retries_per_segment:
+                            with lock: pbar.close()
+                            raise RuntimeError(f"{description} Segment {i+1} indirilemedi. Hata: {error_msg}")
+                        
+                        final_wait = min(wait_time, 30)
+                        with lock: pbar.set_postfix_str(f"Hata! {final_wait}s sonra tekrar...")
+                        time.sleep(final_wait)
+                        with lock: pbar.set_postfix_str("")
+
+                if apply_rate_limit and not ignore_rate_limit:
+                    segments_in_burst += 1
+                    if segments_in_burst >= burst_limit and (i + 1) < len(segment_urls):
+                        pause_duration = random.uniform(2, 5)
+                        with lock: pbar.set_postfix_str(f"Rate-Limit mola ({int(pause_duration)}s)")
+                        time.sleep(pause_duration)
+                        with lock: pbar.set_postfix_str("")
+                        segments_in_burst = 0
+                        burst_limit = random.randint(40, 60)
+
+    def animate_spinner(pbar: tqdm, lock: threading.Lock, stop_event: threading.Event):
+        spinner_chars = ['|', '/', '-', '\\']
+        idx = 0
+        while not stop_event.is_set():
+            with lock:
+                pbar.set_description_str(f"   [-> İndiriliyor] {spinner_chars[idx % len(spinner_chars)]}")
+                pbar.refresh()
+            idx += 1
+            time.sleep(0.1) # Sabit animasyon hızı
 
     try:
         scraper = cloudscraper.create_scraper()
@@ -186,57 +209,75 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
         for match in stream_matches:
             attrs = match.group('attributes')
             url = match.group('url')
-            
             res_match = re.search(r'RESOLUTION=\d+x(\d+)', attrs)
             resolution = int(res_match.group(1)) if res_match else 0
-            
             bw_match = re.search(r'BANDWIDTH=(\d+)', attrs)
             bandwidth = int(bw_match.group(1)) if bw_match else 0
-            
             available_streams.append({'url': url, 'resolution': resolution, 'bandwidth': bandwidth})
 
-        if available_streams:
-            available_streams.sort(key=lambda x: (x['resolution'], x['bandwidth']), reverse=True)
-            best_stream_url = available_streams[0]['url']
-            best_resolution = available_streams[0]['resolution']
-            print(f"-> {best_resolution}p kalitesi indirilmek üzere seçildi.")
+        if not available_streams:
+            raise ValueError("Kalite seçenekleri bulunamadı.")
+            
+        available_streams.sort(key=lambda x: (x['resolution'], x['bandwidth']), reverse=True)
+        best_stream_url = available_streams[0]['url']
+        best_resolution = available_streams[0]['resolution']
+        print(f"-> {best_resolution}p kalitesi indirilmek üzere seçildi.")
 
-            audio_uri_match = re.search(r'#EXT-X-MEDIA:TYPE=AUDIO.*?URI="(.*?)"', master_playlist_content)
-            if audio_uri_match:
-                print("-> Ayrı akışlar tespit edildi. Paralel indirme başlıyor...")
-                audio_playlist_url = urljoin(m_php_url, audio_uri_match.group(1))
-                video_playlist_url = best_stream_url
-                video_task = threading.Thread(target=download_segments, args=(video_playlist_url, temp_video_path, m_php_url, "Video"))
-                audio_task = threading.Thread(target=download_segments, args=(audio_playlist_url, temp_audio_path, m_php_url, "Ses"))
+        audio_uri_match = re.search(r'#EXT-X-MEDIA:TYPE=AUDIO.*?URI="(.*?)"', master_playlist_content)
+        pbar_format = "{desc} {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
+
+        if audio_uri_match:
+            print("-> Ayrı akışlar tespit edildi. Paralel indirme başlıyor...")
+            audio_playlist_url = urljoin(m_php_url, audio_uri_match.group(1))
+            video_playlist_url = best_stream_url
+            
+            video_playlist_text = scraper.get(video_playlist_url, headers=headers_player).text
+            audio_playlist_text = scraper.get(audio_playlist_url, headers=headers_player).text
+            total_video_segments = len(re.findall(r'^(https?://.+)', video_playlist_text, re.MULTILINE))
+            total_audio_segments = len(re.findall(r'^(https?://.+)', audio_playlist_text, re.MULTILINE))
+            total_segments = total_video_segments + total_audio_segments
+
+            with tqdm(total=total_segments, unit=" parça", dynamic_ncols=True, bar_format=pbar_format) as pbar:
+                stop_spinner = threading.Event()
+                
+                spinner_thread = threading.Thread(target=animate_spinner, args=(pbar, print_lock, stop_spinner))
+                video_task = threading.Thread(target=download_segments, args=(video_playlist_url, temp_video_path, m_php_url, "Video", True, print_lock, pbar))
+                audio_task = threading.Thread(target=download_segments, args=(audio_playlist_url, temp_audio_path, m_php_url, "Ses", False, print_lock, pbar))
+                
+                spinner_thread.start()
                 video_task.start()
                 audio_task.start()
+
                 video_task.join()
                 audio_task.join()
-                print("-> İndirmeler tamamlandı.")
-                print("-> FFmpeg ile birleştirme işlemi hazırlanıyor...")
-                command = ['ffmpeg', '-y', '-i', temp_video_path, '-i', temp_audio_path]
-                if altyazi_var: command.extend(['-i', temp_subtitle_path])
-                command.extend(['-map', '0:v:0', '-map', '1:a:0'])
-                if altyazi_var:
-                    command.extend(['-map', '2:s:0', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=tur'])
-                command.extend(['-c:v', 'copy', '-c:a', 'copy', final_output_path])
-            else:
-                print("-> Birleşik video/ses akışı tespit edildi.")
-                combined_playlist_url = best_stream_url
-                download_segments(combined_playlist_url, temp_video_path, m_php_url, "Video/Ses")
-                print("-> FFmpeg ile dönüştürme işlemi hazırlanıyor (remux)...")
-                command = ['ffmpeg', '-y', '-i', temp_video_path]
-                if altyazi_var: command.extend(['-i', temp_subtitle_path])
-                command.extend(['-c', 'copy'])
-                if altyazi_var:
-                    command.extend(['-map', '0', '-map', '-0:s', '-map', '1', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=tur'])
-                command.extend(['-bsf:a', 'aac_adtstoasc', final_output_path])
+                stop_spinner.set()
+                spinner_thread.join()
+
+            print("-> İndirmeler tamamlandı.")
+            print("-> FFmpeg ile birleştirme işlemi hazırlanıyor...")
+            command = ['ffmpeg', '-y', '-i', temp_video_path, '-i', temp_audio_path, '-async', '1']
+            if altyazi_var: command.extend(['-i', temp_subtitle_path])
+            command.extend(['-map', '0:v:0', '-map', '1:a:0'])
+            if altyazi_var:
+                command.extend(['-map', '2:s:0', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=tur'])
+            command.extend(['-c:v', 'copy', '-c:a', 'copy', final_output_path])
         else:
-            print("-> Tek bir video/ses akışı tespit edildi.")
-            playlist_url_match = re.search(r'^(https://.+)', master_playlist_content, re.MULTILINE)
-            if not playlist_url_match: raise ValueError("Birleşik akış için playlist URL'si bulunamadı.")
-            combined_playlist_url = playlist_url_match.group(1)
-            download_segments(combined_playlist_url, temp_video_path, m_php_url, "Video/Ses")
+            print("-> Birleşik video/ses akışı tespit edildi.")
+            combined_playlist_url = best_stream_url
+            
+            combined_playlist_text = scraper.get(combined_playlist_url, headers=headers_player).text
+            total_segments = len(re.findall(r'^(https?://.+)', combined_playlist_text, re.MULTILINE))
+
+            with tqdm(total=total_segments, unit=" parça", dynamic_ncols=True, bar_format=pbar_format) as pbar:
+                stop_spinner = threading.Event()
+                spinner_thread = threading.Thread(target=animate_spinner, args=(pbar, print_lock, stop_spinner))
+                
+                spinner_thread.start()
+                download_segments(combined_playlist_url, temp_video_path, m_php_url, "Video/Ses", True, print_lock, pbar)
+                stop_spinner.set()
+                spinner_thread.join()
+
+            print("-> İndirmeler tamamlandı.")
             print("-> FFmpeg ile dönüştürme işlemi hazırlanıyor (remux)...")
             command = ['ffmpeg', '-y', '-i', temp_video_path]
             if altyazi_var: command.extend(['-i', temp_subtitle_path])
