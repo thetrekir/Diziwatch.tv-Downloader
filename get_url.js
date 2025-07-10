@@ -10,7 +10,7 @@ puppeteer.use(StealthPlugin());
 const CACHE_FILE = 'fillerlist_cache.json';
 const CACHE_DURATION_DAYS = 7;
 
-function normalizeShowName(name) {
+function normalizeShowName(name) {SS
     if (!name) return '';
     return name
         .toLowerCase()
@@ -25,14 +25,16 @@ function normalizeShowName(name) {
 async function getDiziwatchData(page, episodeUrl) {
     let foundSource2Url = null;
     let foundSubtitleUrl = null;
+    let isDemuxed = false;
+    let demuxedLogged = false;
 
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36');
     await page.setViewport({ width: 1920, height: 1080 });
-    
+
     const client = await page.target().createCDPSession();
     await client.send('Network.enable');
-    await client.send('Network.setBlockedURLs', { 
-        urls: ['*fastly.jsdelivr.net*', '*cdn.jsdelivr.net*'] 
+    await client.send('Network.setBlockedURLs', {
+        urls: ['*fastly.jsdelivr.net*', '*cdn.jsdelivr.net*']
     });
 
     let subtitlePriority = 0;
@@ -41,45 +43,73 @@ async function getDiziwatchData(page, episodeUrl) {
 
     const requestListener = (request) => {
         const url = request.url();
+
         if (url.includes('source2.php') && !foundSource2Url) {
+            console.error('Sinyal yakalandı: source2.php');
             foundSource2Url = url;
         }
-        if (url.includes('.vtt')) {
-           let p = 0;
-           if (url.includes('translateden.vtt')) p = 4;
-           else if (url.includes('.tr.')) p = 3;
-           else if (!url.includes('en.vtt')) p = 2;
-           else if (url.includes('en.vtt')) p = 1;
-           if (p > subtitlePriority) {
-               foundSubtitleUrl = url;
-               subtitlePriority = p;
-           }
+
+        if (url.includes('/ld.php')) {
+            isDemuxed = true;
+            if (!demuxedLogged) {
+                console.error('Akış tipi: Ayrı ses/video (altyazı aranacak)');
+                demuxedLogged = true;
+            }
         }
-        if (foundSource2Url && subtitlePriority === 4) {
-            resolveDetection();
+
+        if (url.includes('.vtt')) {
+            let p = 0;
+            if (url.includes('translateden.vtt')) p = 4;
+            else if (url.includes('.tr.')) p = 3;
+            else if (!url.includes('en.vtt')) p = 2;
+            else if (url.includes('en.vtt')) p = 1;
+
+            if (p > subtitlePriority) {
+                console.error(`Altyazı sinyali: ${url.split('/').pop()}`);
+                foundSubtitleUrl = url;
+                subtitlePriority = p;
+            }
+            
+            if (isDemuxed && subtitlePriority === 4 && foundSource2Url) {
+                resolveDetection();
+            }
         }
     };
-    
+
     page.on('request', requestListener);
     detectionPromise.finally(() => page.off('request', requestListener));
 
-    const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error("Zaman asimi: URL'ler 20 saniye icinde bulunamadi.")), 20000)
+    const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Zaman aşımı: Gerekli URL'ler 20 saniye içinde bulunamadı.")), 20000)
     );
 
-    await page.goto(episodeUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+    const mainTask = async () => {
+        await page.goto(episodeUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
 
-    if (!foundSource2Url) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
         if (!foundSource2Url) {
-            try {
-                await page.mouse.click(page.viewport().width / 2, page.viewport().height / 2);
-            } catch (e) {}
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            if (!foundSource2Url) {
+                try {
+                    console.error("Player etkileşimi simüle ediliyor...");
+                    await page.mouse.click(page.viewport().width / 2, page.viewport().height / 2);
+                } catch (e) {}
+            }
         }
-    }
-    
+
+        await new Promise(resolve => setTimeout(resolve, 4000));
+        
+        if (foundSource2Url && !isDemuxed) {
+            console.error('Akış tipi: Birleşik ses/video (altyazı beklenmeyecek)');
+            resolveDetection();
+            return;
+        }
+        
+        await detectionPromise;
+    };
+
+
     try {
-        await Promise.race([detectionPromise, timeoutPromise]);
+        await Promise.race([mainTask(), timeoutPromise]);
     } catch (e) {
         if (!foundSource2Url) {
             throw e;
@@ -90,6 +120,7 @@ async function getDiziwatchData(page, episodeUrl) {
 }
 
 async function getFillerList(page, showNameToSearch) {
+    console.error(`Filler listesi alınıyor: "${showNameToSearch}"`);
     let allShows = {}, cacheIsValid = false;
     try {
         const stats = await fs.stat(CACHE_FILE);
@@ -98,8 +129,10 @@ async function getFillerList(page, showNameToSearch) {
     } catch (e) { cacheIsValid = false; }
 
     if (cacheIsValid) {
+        console.error('Filler listesi önbellekten (cache) okundu.');
         allShows = JSON.parse(await fs.readFile(CACHE_FILE, 'utf-8'));
     } else {
+        console.error("Animefillerlist.com'dan güncel dizi listesi çekiliyor...");
         await page.goto("https://www.animefillerlist.com/shows/", { waitUntil: 'networkidle2' });
         const content = await page.content();
         const $ = cheerio.load(content);
@@ -122,9 +155,7 @@ async function getFillerList(page, showNameToSearch) {
     
     try {
         await page.waitForSelector('#Condensed', { timeout: 15000 });
-    } catch(e) {
-        return [];
-    }
+    } catch(e) { return []; }
 
     const content = await page.content();
     const $ = cheerio.load(content);
@@ -182,8 +213,12 @@ async function main() {
         if (finalOutput.filler_list) console.log(`FILLER_LIST: ${JSON.stringify(finalOutput.filler_list)}`);
 
     } catch (e) {
+        console.error(`HATA: ${e.message}`);
         const errorPath = `error_screenshot_${Date.now()}.png`;
-        try { await page.screenshot({ path: errorPath, fullPage: true }); } catch (ssError) {}
+        try { 
+            await page.screenshot({ path: errorPath, fullPage: true });
+            console.error(`Hata anı ekran görüntüsü kaydedildi: ${errorPath}`);
+        } catch (ssError) {}
         process.exit(1);
     } finally {
         if (browser) await browser.close();
