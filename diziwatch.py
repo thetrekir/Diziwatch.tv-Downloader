@@ -382,7 +382,7 @@ def main():
                         ]
                         canon_count = len([ep_num for ep_num in episode_numbers if ep_num not in filler_list])
                         
-                        print(f"-> Özet: Toplam {total_episodes} bölümden, {len(filler_list)} tanesi filler/mixed olarak işaretlendi.")
+                        print(f"-> Özet: Toplam {total_episodes} bölümden, {len(filler_list)} tanesi filler olarak işaretlendi.")
                         print(f"-> İndirilecek canon bölüm sayısı: {canon_count}")
                     else:
                         print("UYARI: Filler listesi alınamadı. Tüm bölümler indirilecek.")
