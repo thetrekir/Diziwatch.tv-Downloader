@@ -1,5 +1,3 @@
-// get_url.js
-
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const fs = require('fs').promises;
@@ -10,7 +8,7 @@ puppeteer.use(StealthPlugin());
 const CACHE_FILE = 'fillerlist_cache.json';
 const CACHE_DURATION_DAYS = 7;
 
-function normalizeShowName(name) {SS
+function normalizeShowName(name) {
     if (!name) return '';
     return name
         .toLowerCase()
@@ -32,88 +30,94 @@ async function getDiziwatchData(page, episodeUrl) {
     await page.setViewport({ width: 1920, height: 1080 });
 
     const client = await page.target().createCDPSession();
-    await client.send('Network.enable');
-    await client.send('Network.setBlockedURLs', {
-        urls: ['*fastly.jsdelivr.net*', '*cdn.jsdelivr.net*']
-    });
-
-    let subtitlePriority = 0;
-    let resolveDetection;
-    const detectionPromise = new Promise(resolve => { resolveDetection = resolve; });
-
-    const requestListener = (request) => {
-        const url = request.url();
-
-        if (url.includes('source2.php') && !foundSource2Url) {
-            console.error('Sinyal yakalandı: source2.php');
-            foundSource2Url = url;
-        }
-
-        if (url.includes('/ld.php')) {
-            isDemuxed = true;
-            if (!demuxedLogged) {
-                console.error('Akış tipi: Ayrı ses/video (altyazı aranacak)');
-                demuxedLogged = true;
-            }
-        }
-
-        if (url.includes('.vtt')) {
-            let p = 0;
-            if (url.includes('translateden.vtt')) p = 4;
-            else if (url.includes('.tr.')) p = 3;
-            else if (!url.includes('en.vtt')) p = 2;
-            else if (url.includes('en.vtt')) p = 1;
-
-            if (p > subtitlePriority) {
-                console.error(`Altyazı sinyali: ${url.split('/').pop()}`);
-                foundSubtitleUrl = url;
-                subtitlePriority = p;
-            }
-            
-            if (isDemuxed && subtitlePriority === 4 && foundSource2Url) {
-                resolveDetection();
-            }
-        }
-    };
-
-    page.on('request', requestListener);
-    detectionPromise.finally(() => page.off('request', requestListener));
-
-    const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Zaman aşımı: Gerekli URL'ler 20 saniye içinde bulunamadı.")), 20000)
-    );
-
-    const mainTask = async () => {
-        await page.goto(episodeUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-
-        if (!foundSource2Url) {
-            await new Promise(resolve => setTimeout(resolve, 2000));
-            if (!foundSource2Url) {
-                try {
-                    console.error("Player etkileşimi simüle ediliyor...");
-                    await page.mouse.click(page.viewport().width / 2, page.viewport().height / 2);
-                } catch (e) {}
-            }
-        }
-
-        await new Promise(resolve => setTimeout(resolve, 4000));
-        
-        if (foundSource2Url && !isDemuxed) {
-            console.error('Akış tipi: Birleşik ses/video (altyazı beklenmeyecek)');
-            resolveDetection();
-            return;
-        }
-        
-        await detectionPromise;
-    };
-
 
     try {
-        await Promise.race([mainTask(), timeoutPromise]);
-    } catch (e) {
-        if (!foundSource2Url) {
-            throw e;
+        await client.send('Network.enable');
+        await client.send('Network.setBlockedURLs', {
+            urls: ['*fastly.jsdelivr.net*', '*cdn.jsdelivr.net*']
+        });
+
+        let subtitlePriority = 0;
+        let resolveDetection;
+        const detectionPromise = new Promise(resolve => { resolveDetection = resolve; });
+
+        const requestListener = (request) => {
+            const url = request.url();
+
+            if (url.includes('source2.php') && !foundSource2Url) {
+                console.error('Sinyal yakalandı: source2.php');
+                foundSource2Url = url;
+            }
+
+            if (url.includes('/ld.php')) {
+                isDemuxed = true;
+                if (!demuxedLogged) {
+                    console.error('Akış tipi: Ayrı ses/video (altyazı aranacak)');
+                    demuxedLogged = true;
+                }
+            }
+
+            if (url.includes('.vtt')) {
+                let p = 0;
+                if (url.includes('translateden.vtt')) p = 4;
+                else if (url.includes('.tr.')) p = 3;
+                else if (!url.includes('en.vtt')) p = 2;
+                else if (url.includes('en.vtt')) p = 1;
+
+                if (p > subtitlePriority) {
+                    console.error(`Altyazı sinyali: ${url.split('/').pop()}`);
+                    foundSubtitleUrl = url;
+                    subtitlePriority = p;
+                }
+                
+                if (isDemuxed && subtitlePriority === 4 && foundSource2Url) {
+                    resolveDetection();
+                }
+            }
+        };
+
+        page.on('request', requestListener);
+        detectionPromise.finally(() => page.off('request', requestListener));
+
+        const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error("Zaman aşımı: Gerekli URL'ler 20 saniye içinde bulunamadı.")), 20000)
+        );
+
+        const mainTask = async () => {
+            await page.goto(episodeUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+
+            if (!foundSource2Url) {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                if (!foundSource2Url) {
+                    try {
+                        console.error("Player etkileşimi simüle ediliyor...");
+                        await page.mouse.click(page.viewport().width / 2, page.viewport().height / 2);
+                    } catch (e) {}
+                }
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 4000));
+            
+            if (foundSource2Url && !isDemuxed) {
+                console.error('Akış tipi: Birleşik ses/video (altyazı beklenmeyecek)');
+                resolveDetection();
+                return;
+            }
+            
+            await detectionPromise;
+        };
+
+
+        try {
+            await Promise.race([mainTask(), timeoutPromise]);
+        } catch (e) {
+            if (!foundSource2Url) {
+                throw e;
+            }
         }
+    } finally {
+        await client.send('Network.setBlockedURLs', { urls: [] });
+        await client.detach();
     }
 
     return { source_url: foundSource2Url, subtitle_url: foundSubtitleUrl };
@@ -151,9 +155,8 @@ async function getFillerList(page, showNameToSearch) {
 
     if (!foundLink) return [];
     
-    await page.goto("https://www.animefillerlist.com" + foundLink, { waitUntil: 'networkidle2' });
-    
     try {
+        await page.goto("https://www.animefillerlist.com" + foundLink, { waitUntil: 'networkidle2' });
         await page.waitForSelector('#Condensed', { timeout: 15000 });
     } catch(e) { return []; }
 
