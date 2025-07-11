@@ -59,18 +59,21 @@ async function getDiziwatchData(page, episodeUrl) {
 
             if (url.includes('.vtt')) {
                 let p = 0;
-                if (url.includes('translateden.vtt')) p = 4;
-                else if (url.includes('.tr.')) p = 3;
-                else if (!url.includes('en.vtt')) p = 2;
-                else if (url.includes('en.vtt')) p = 1;
+                
+                if (url.includes('translateden.vtt')) p = 6;
+                else if ((url.includes('tr.vtt') || url.includes('.tr.')) && !url.includes('-forced')) p = 5;
+                else if ((url.includes('en.vtt') || url.includes('.en.')) && !url.includes('-forced')) p = 4;
+                else if (!url.includes('-forced')) p = 3; 
+                else if (url.includes('tr-forced.vtt')) p = 2;
+                else if (url.includes('en-forced.vtt')) p = 1;
 
                 if (p > subtitlePriority) {
-                    console.error(`Altyazı sinyali: ${url.split('/').pop()}`);
+                    console.error(`Altyazı sinyali: ${url.split('/').pop()} (Öncelik: ${p})`);
                     foundSubtitleUrl = url;
                     subtitlePriority = p;
                 }
                 
-                if (isDemuxed && subtitlePriority === 4 && foundSource2Url) {
+                if (isDemuxed && subtitlePriority >= 5 && foundSource2Url) {
                     resolveDetection();
                 }
             }
@@ -116,6 +119,7 @@ async function getDiziwatchData(page, episodeUrl) {
             }
         }
     } finally {
+        console.error("Diziwatch ağ ayarları temizleniyor...");
         await client.send('Network.setBlockedURLs', { urls: [] });
         await client.detach();
     }
