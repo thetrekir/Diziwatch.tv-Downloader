@@ -110,6 +110,28 @@ def radari_calistir(episode_url: str, get_fillers: bool = False, show_name: str 
             else:
                 time.sleep(3)
 
+
+def get_audio_codec(file_path: str) -> str | None:
+    try:
+        command = [
+            'ffprobe', 
+            '-v', 'quiet', 
+            '-print_format', 'json', 
+            '-show_streams', 
+            '-select_streams', 'a:0', 
+            file_path
+        ]
+        result = subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8')
+        streams_info = json.loads(result.stdout)
+        if streams_info and 'streams' in streams_info and streams_info['streams']:
+            return streams_info['streams'][0].get('codec_name')
+        return None
+    except FileNotFoundError:
+        raise RuntimeError("ffprobe bulunamadı. FFmpeg kurulumunu ve PATH'i kontrol et.")
+    except (subprocess.CalledProcessError, json.JSONDecodeError, IndexError):
+        print("   - UYARI: Ses kodeği tespit edilemedi. Filtresiz devam edilecek.")
+        return None
+
 def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str, ignore_rate_limit: bool = False):
     
     temp_video_path = final_output_path + ".video.ts"
@@ -121,7 +143,6 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
 
     def download_segments(playlist_url, output_path, referer, description, apply_rate_limit: bool, lock: threading.Lock, pbar: tqdm):
         scraper = cloudscraper.create_scraper()
-        
         try:
             playlist_response = scraper.get(playlist_url, headers={'Referer': referer}, timeout=20)
             playlist_response.raise_for_status()
@@ -149,14 +170,11 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
                     except requests.exceptions.RequestException as e:
                         retries += 1
                         error_str = str(e)
-                        
                         if 'RemoteDisconnected' in error_str: error_msg, wait_time = "Sunucu bağlantıyı kapattı", 8
                         else: error_msg, wait_time = "Bağlantı hatası", 5 * retries
-                        
                         if retries >= max_retries_per_segment:
                             with lock: pbar.close()
                             raise RuntimeError(f"{description} Segment {i+1} indirilemedi. Hata: {error_msg}")
-                        
                         final_wait = min(wait_time, 30)
                         with lock: pbar.set_postfix_str(f"Hata! {final_wait}s sonra tekrar...")
                         time.sleep(final_wait)
@@ -205,23 +223,15 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
         
         available_streams = []
         stream_matches = re.finditer(r'#EXT-X-STREAM-INF:(?P<attributes>.*?)\n(?P<url>https?://[^\s]+)', master_playlist_content)
-        
         for match in stream_matches:
-            attrs = match.group('attributes')
-            url = match.group('url')
-            res_match = re.search(r'RESOLUTION=\d+x(\d+)', attrs)
-            resolution = int(res_match.group(1)) if res_match else 0
-            bw_match = re.search(r'BANDWIDTH=(\d+)', attrs)
-            bandwidth = int(bw_match.group(1)) if bw_match else 0
+            attrs = match.group('attributes'); url = match.group('url')
+            res_match = re.search(r'RESOLUTION=\d+x(\d+)', attrs); resolution = int(res_match.group(1)) if res_match else 0
+            bw_match = re.search(r'BANDWIDTH=(\d+)', attrs); bandwidth = int(bw_match.group(1)) if bw_match else 0
             available_streams.append({'url': url, 'resolution': resolution, 'bandwidth': bandwidth})
-
-        if not available_streams:
-            raise ValueError("Kalite seçenekleri bulunamadı.")
-            
+        if not available_streams: raise ValueError("Kalite seçenekleri bulunamadı.")
         available_streams.sort(key=lambda x: (x['resolution'], x['bandwidth']), reverse=True)
         best_stream_url = available_streams[0]['url']
-        best_resolution = available_streams[0]['resolution']
-        print(f"-> {best_resolution}p kalitesi indirilmek üzere seçildi.")
+        print(f"-> {available_streams[0]['resolution']}p kalitesi indirilmek üzere seçildi.")
 
         audio_uri_match = re.search(r'#EXT-X-MEDIA:TYPE=AUDIO.*?URI="(.*?)"', master_playlist_content)
         pbar_format = "{desc} {percentage:3.0f}% {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}{postfix}]"
@@ -233,29 +243,22 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
             
             video_playlist_text = scraper.get(video_playlist_url, headers=headers_player).text
             audio_playlist_text = scraper.get(audio_playlist_url, headers=headers_player).text
-            total_video_segments = len(re.findall(r'^(https?://.+)', video_playlist_text, re.MULTILINE))
-            total_audio_segments = len(re.findall(r'^(https?://.+)', audio_playlist_text, re.MULTILINE))
-            total_segments = total_video_segments + total_audio_segments
+            total_segments = len(re.findall(r'^(https?://.+)', video_playlist_text, re.MULTILINE)) + \
+                             len(re.findall(r'^(https?://.+)', audio_playlist_text, re.MULTILINE))
 
             with tqdm(total=total_segments, unit=" parça", dynamic_ncols=True, bar_format=pbar_format) as pbar:
                 stop_spinner = threading.Event()
-                
                 spinner_thread = threading.Thread(target=animate_spinner, args=(pbar, print_lock, stop_spinner))
                 video_task = threading.Thread(target=download_segments, args=(video_playlist_url, temp_video_path, m_php_url, "Video", True, print_lock, pbar))
                 audio_task = threading.Thread(target=download_segments, args=(audio_playlist_url, temp_audio_path, m_php_url, "Ses", False, print_lock, pbar))
                 
-                spinner_thread.start()
-                video_task.start()
-                audio_task.start()
-
-                video_task.join()
-                audio_task.join()
-                stop_spinner.set()
-                spinner_thread.join()
+                spinner_thread.start(); video_task.start(); audio_task.start()
+                video_task.join(); audio_task.join()
+                stop_spinner.set(); spinner_thread.join()
 
             print("-> İndirmeler tamamlandı.")
             print("-> FFmpeg ile birleştirme işlemi hazırlanıyor...")
-            command = ['ffmpeg', '-y', '-i', temp_video_path, '-i', temp_audio_path, '-async', '1']
+            command = ['ffmpeg', '-y', '-i', temp_video_path, '-i', temp_audio_path]
             if altyazi_var: command.extend(['-i', temp_subtitle_path])
             command.extend(['-map', '0:v:0', '-map', '1:a:0'])
             if altyazi_var:
@@ -271,31 +274,40 @@ def indir_ve_donustur(source_url: str, subtitle_url: str, final_output_path: str
             with tqdm(total=total_segments, unit=" parça", dynamic_ncols=True, bar_format=pbar_format) as pbar:
                 stop_spinner = threading.Event()
                 spinner_thread = threading.Thread(target=animate_spinner, args=(pbar, print_lock, stop_spinner))
-                
                 spinner_thread.start()
                 download_segments(combined_playlist_url, temp_video_path, m_php_url, "Video/Ses", True, print_lock, pbar)
-                stop_spinner.set()
-                spinner_thread.join()
+                stop_spinner.set(); spinner_thread.join()
 
             print("-> İndirmeler tamamlandı.")
             print("-> FFmpeg ile dönüştürme işlemi hazırlanıyor (remux)...")
+            
+            audio_codec = get_audio_codec(temp_video_path)
+            
             command = ['ffmpeg', '-y', '-i', temp_video_path]
-            if altyazi_var: command.extend(['-i', temp_subtitle_path])
+            if altyazi_var:
+                command.extend(['-i', temp_subtitle_path])
+            
             command.extend(['-c', 'copy'])
+            
             if altyazi_var:
                 command.extend(['-map', '0', '-map', '-0:s', '-map', '1', '-c:s', 'mov_text', '-metadata:s:s:0', 'language=tur'])
-            command.extend(['-bsf:a', 'aac_adtstoasc', final_output_path])
+
+            if audio_codec == 'aac':
+                command.extend(['-bsf:a', 'aac_adtstoasc'])
+            
+            command.append(final_output_path)
         
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         print("-> Dönüştürme tamamlandı.")
 
     except FileNotFoundError:
         raise RuntimeError("FFmpeg bulunamadı. Kurup PATH'e eklediğinden emin ol.")
     except subprocess.CalledProcessError as e:
-        print(f"HATA: FFmpeg dönüştürme sırasında hata verdi.")
+        error_output = e.stderr.decode('utf-8', errors='ignore').strip()
+        print(f"HATA: FFmpeg dönüştürme sırasında hata verdi. Çıkış Kodu: {e.returncode}\nFFmpeg Çıktısı: {error_output}")
         raise
     finally:
-        for f in temp_files:
+         for f in temp_files:
             if os.path.exists(f):
                 os.remove(f)
 
